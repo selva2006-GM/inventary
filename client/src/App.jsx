@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-const API = "http://localhost:5000/api"; 
+const API = import.meta.env.SERVER_API; 
 
 const emptyForm = {
   name: "",
@@ -30,7 +30,9 @@ const emptySaleForm = {
   quantity: "1",
   actual_price: "",
 };
-async function editSale(sale) {
+
+  
+  async function editSale(sale) {
     const quantityInput = prompt("Updated quantity:", sale.quantity);
     if (quantityInput === null) return;
   
