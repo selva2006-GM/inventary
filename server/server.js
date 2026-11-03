@@ -14,7 +14,7 @@ app.get("/", (req, res) => {
   res.json({ message: "Inventory API is running!" });
 });
 
-// Get all products
+// Get all active products
 app.get("/api/products", async (req, res) => {
   try {
     const result = await pool.query(
@@ -24,27 +24,28 @@ app.get("/api/products", async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Failed to fetch products" });
+    res.status(500).json({ error: "Failed to fetch products." });
   }
 });
 
 // Add a product
 app.post("/api/products", async (req, res) => {
   try {
-    const {
-      name,
-      image_url,
-      purchase_price,
-      selling_price,
-      quantity,
-    } = req.body;
+    const { name, image_url, purchase_price, selling_price, quantity } =
+      req.body;
+
+    const cost = Number(purchase_price);
+    const price = Number(selling_price);
+    const qty = Number(quantity);
 
     if (
-      !name ||
-      purchase_price < 0 ||
-      selling_price < 0 ||
-      quantity < 0 ||
-      !Number.isInteger(Number(quantity))
+      !name?.trim() ||
+      !Number.isFinite(cost) ||
+      cost < 0 ||
+      !Number.isFinite(price) ||
+      price < 0 ||
+      !Number.isInteger(qty) ||
+      qty < 0
     ) {
       return res.status(400).json({
         error: "Please provide valid product details.",
@@ -56,30 +57,21 @@ app.post("/api/products", async (req, res) => {
        (name, image_url, purchase_price, selling_price, quantity)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [
-        name.trim(),
-        image_url || null,
-        purchase_price,
-        selling_price,
-        quantity,
-      ]
+      [name.trim(), image_url || null, cost, price, qty]
     );
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Failed to add product" });
+    res.status(500).json({ error: "Failed to add product." });
   }
 });
 
-
 // Record a sale
 app.post("/api/sales", async (req, res) => {
-  const { product_id, quantity, actual_price } = req.body;
-
-  const productId = Number(product_id);
-  const qty = Number(quantity);
-  const price = Number(actual_price);
+  const productId = Number(req.body.product_id);
+  const qty = Number(req.body.quantity);
+  const price = Number(req.body.actual_price);
 
   if (
     !Number.isInteger(productId) ||
@@ -99,36 +91,33 @@ app.post("/api/sales", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Lock the product row to prevent overselling
     const productResult = await client.query(
       `SELECT * FROM products
-       WHERE id = $1
+       WHERE id = $1 AND is_active = TRUE
        FOR UPDATE`,
       [productId]
     );
 
-    if (productResult.rows.length === 0) {
+    if (!productResult.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Product not found." });
     }
 
     const product = productResult.rows[0];
+    const available = Number(product.quantity);
 
-    if (qty > product.quantity) {
+    if (qty > available) {
       await client.query("ROLLBACK");
       return res.status(400).json({
-        error: `Only ${product.quantity} items are available.`,
+        error: `Only ${available} items are available.`,
       });
     }
 
     const purchasePrice = Number(product.purchase_price);
     const regularPrice = Number(product.selling_price);
-
     const totalAmount = price * qty;
-    const totalCost = purchasePrice * qty;
-    const profit = totalAmount - totalCost;
+    const profit = totalAmount - purchasePrice * qty;
 
-    // Reduce stock
     const updatedProduct = await client.query(
       `UPDATE products
        SET quantity = quantity - $1
@@ -137,7 +126,6 @@ app.post("/api/sales", async (req, res) => {
       [qty, productId]
     );
 
-    // Save the sale
     const saleResult = await client.query(
       `INSERT INTO sales
        (product_id, quantity, purchase_price, regular_price,
@@ -155,15 +143,14 @@ app.post("/api/sales", async (req, res) => {
       ]
     );
 
-    // Record the stock change
     await client.query(
       `INSERT INTO stock_logs
        (product_id, previous_quantity, new_quantity, change_type)
        VALUES ($1, $2, $3, $4)`,
       [
         productId,
-        product.quantity,
-        updatedProduct.rows[0].quantity,
+        available,
+        Number(updatedProduct.rows[0].quantity),
         "sale",
       ]
     );
@@ -173,7 +160,7 @@ app.post("/api/sales", async (req, res) => {
     res.status(201).json({
       message: "Sale recorded successfully.",
       sale: saleResult.rows[0],
-      remaining_quantity: updatedProduct.rows[0].quantity,
+      remaining_quantity: Number(updatedProduct.rows[0].quantity),
       discount_per_item: Math.max(0, regularPrice - price),
       profit,
       loss: Math.max(0, -profit),
@@ -204,42 +191,31 @@ app.get("/api/sales", async (req, res) => {
   }
 });
 
-
-
-
-// Daily stock count
+// Adjust stock for one product.
+// Decrease = record a sale at the current selling price.
+// Increase = add stock only.
+// No change = do nothing.
 app.post("/api/stock-count", async (req, res) => {
-  const { mode, counts } = req.body;
+  const { counts } = req.body;
 
-  if (
-    !["selected", "all"].includes(mode) ||
-    !Array.isArray(counts) ||
-    counts.length === 0
-  ) {
+  if (!Array.isArray(counts) || counts.length !== 1) {
     return res.status(400).json({
-      error: "Choose selected or all and provide stock counts.",
+      error: "Provide one product and its new stock quantity.",
     });
   }
 
-  const seen = new Set();
+  const productId = Number(counts[0].product_id);
+  const newQuantity = Number(counts[0].quantity);
 
-  for (const item of counts) {
-    const id = Number(item.product_id);
-    const quantity = Number(item.quantity);
-
-    if (
-      !Number.isInteger(id) ||
-      id <= 0 ||
-      !Number.isInteger(quantity) ||
-      quantity < 0 ||
-      seen.has(id)
-    ) {
-      return res.status(400).json({
-        error: "Invalid or duplicate product count.",
-      });
-    }
-
-    seen.add(id);
+  if (
+    !Number.isInteger(productId) ||
+    productId <= 0 ||
+    !Number.isInteger(newQuantity) ||
+    newQuantity < 0
+  ) {
+    return res.status(400).json({
+      error: "Product ID and stock quantity must be valid whole numbers.",
+    });
   }
 
   const client = await pool.connect();
@@ -247,86 +223,107 @@ app.post("/api/stock-count", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Lock all products in ID order
-    const products = await client.query(
-      "SELECT * FROM products ORDER BY id FOR UPDATE"
+    const found = await client.query(
+      `SELECT * FROM products
+       WHERE id = $1 AND is_active = TRUE
+       FOR UPDATE`,
+      [productId]
     );
 
-    const productMap = new Map(
-      products.rows.map((p) => [p.id, p])
-    );
-
-    if (
-      mode === "all" &&
-      counts.length !== products.rows.length
-    ) {
-      throw new Error(
-        "Provide a count for every product in your inventory."
-      );
+    if (!found.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Product not found." });
     }
 
-    const results = [];
+    const product = found.rows[0];
+    const previousQuantity = Number(product.quantity);
+    const difference = previousQuantity - newQuantity;
 
-    for (const item of counts) {
-      const id = Number(item.product_id);
-      const quantity = Number(item.quantity);
-      const product = productMap.get(id);
-
-      if (!product) {
-        throw new Error(`Product ${id} was not found.`);
-      }
-
-      const previous = product.quantity;
-      const difference = quantity - previous;
-
-      await client.query(
-        "UPDATE products SET quantity = $1 WHERE id = $2",
-        [quantity, id]
-      );
-
-      await client.query(
-        `INSERT INTO stock_logs
-         (product_id, previous_quantity, new_quantity, change_type)
-         VALUES ($1, $2, $3, $4)`,
-        [id, previous, quantity, "stock_count"]
-      );
-
-      results.push({
-        product_id: id,
-        name: product.name,
-        previous_quantity: previous,
-        new_quantity: quantity,
-        difference,
+    if (difference === 0) {
+      await client.query("COMMIT");
+      return res.json({
+        message: "Stock is unchanged.",
+        product_id: productId,
+        previous_quantity: previousQuantity,
+        new_quantity: newQuantity,
+        sale: null,
       });
+    }
+
+    await client.query(
+      "UPDATE products SET quantity = $1 WHERE id = $2",
+      [newQuantity, productId]
+    );
+
+    await client.query(
+      `INSERT INTO stock_logs
+       (product_id, previous_quantity, new_quantity, change_type)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        productId,
+        previousQuantity,
+        newQuantity,
+        difference > 0 ? "sale_stock_adjustment" : "stock_increase",
+      ]
+    );
+
+    let sale = null;
+
+    if (difference > 0) {
+      const quantitySold = difference;
+      const purchasePrice = Number(product.purchase_price);
+      const regularPrice = Number(product.selling_price);
+      const totalAmount = regularPrice * quantitySold;
+      const profit = totalAmount - purchasePrice * quantitySold;
+
+      const saleResult = await client.query(
+        `INSERT INTO sales
+         (product_id, quantity, purchase_price, regular_price,
+          actual_price, total_amount, profit)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [
+          productId,
+          quantitySold,
+          purchasePrice,
+          regularPrice,
+          regularPrice,
+          totalAmount,
+          profit,
+        ]
+      );
+
+      sale = saleResult.rows[0];
     }
 
     await client.query("COMMIT");
 
     res.json({
-      message: "Stock count saved successfully.",
-      mode,
-      products_updated: results.length,
-      results,
+      message:
+        difference > 0
+          ? `Stock reduced; ${difference} item(s) recorded as a sale.`
+          : `Stock increased by ${Math.abs(difference)} item(s).`,
+      product_id: productId,
+      previous_quantity: previousQuantity,
+      new_quantity: newQuantity,
+      sale,
     });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
-
-    res.status(400).json({
-      error: error.message || "Failed to save stock count.",
-    });
+    res.status(500).json({ error: "Failed to adjust stock." });
   } finally {
     client.release();
   }
 });
 
-
-// Edit a product
+// Edit product details.
+// Stock quantity changes made here are logged as manual adjustments.
 app.put("/api/products/:id", async (req, res) => {
+  const id = Number(req.params.id);
   const { name, image_url, purchase_price, selling_price, quantity } =
     req.body;
 
-  const id = Number(req.params.id);
   const cost = Number(purchase_price);
   const price = Number(selling_price);
   const qty = Number(quantity);
@@ -342,9 +339,7 @@ app.put("/api/products/:id", async (req, res) => {
     !Number.isInteger(qty) ||
     qty < 0
   ) {
-    return res.status(400).json({
-      error: "Invalid product details.",
-    });
+    return res.status(400).json({ error: "Invalid product details." });
   }
 
   const client = await pool.connect();
@@ -378,12 +373,12 @@ app.put("/api/products/:id", async (req, res) => {
       [name.trim(), image_url || null, cost, price, qty, id]
     );
 
-    if (qty !== product.quantity) {
+    if (qty !== Number(product.quantity)) {
       await client.query(
         `INSERT INTO stock_logs
          (product_id, previous_quantity, new_quantity, change_type)
          VALUES ($1, $2, $3, 'manual_adjustment')`,
-        [id, product.quantity, qty]
+        [id, Number(product.quantity), qty]
       );
     }
 
@@ -429,7 +424,7 @@ app.delete("/api/products/:id", async (req, res) => {
   }
 });
 
-// Get stock change history (sales + stock counts + manual adjustments)
+// Get stock change history
 app.get("/api/stock-logs", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -453,9 +448,162 @@ app.get("/api/stock-logs", async (req, res) => {
   }
 });
 
+// Edit a sale and adjust inventory by the quantity difference
+app.put("/api/sales/:id", async (req, res) => {
+  const saleId = Number(req.params.id);
+  const quantity = Number(req.body.quantity);
+  const actualPrice = Number(req.body.actual_price);
 
+  if (
+    !Number.isInteger(saleId) || saleId <= 0 ||
+    !Number.isInteger(quantity) || quantity <= 0 ||
+    !Number.isFinite(actualPrice) || actualPrice < 0
+  ) {
+    return res.status(400).json({ error: "Enter a valid quantity and price." });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const saleResult = await client.query(
+      "SELECT * FROM sales WHERE id = $1 FOR UPDATE",
+      [saleId]
+    );
+
+    if (!saleResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Sale not found." });
+    }
+
+    const sale = saleResult.rows[0];
+    const oldQuantity = Number(sale.quantity);
+    const difference = oldQuantity - quantity;
+
+    const productResult = await client.query(
+      "SELECT * FROM products WHERE id = $1 FOR UPDATE",
+      [sale.product_id]
+    );
+
+    if (!productResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Product not found." });
+    }
+
+    const product = productResult.rows[0];
+    const newStock = Number(product.quantity) + difference;
+
+    if (newStock < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "Not enough stock to increase this sale quantity."
+      });
+    }
+
+    const purchasePrice = Number(sale.purchase_price);
+    const totalAmount = actualPrice * quantity;
+    const profit = totalAmount - purchasePrice * quantity;
+
+    await client.query(
+      "UPDATE products SET quantity = $1 WHERE id = $2",
+      [newStock, sale.product_id]
+    );
+
+    const updatedSale = await client.query(
+      `UPDATE sales
+       SET quantity = $1,
+           actual_price = $2,
+           total_amount = $3,
+           profit = $4
+       WHERE id = $5
+       RETURNING *`,
+      [quantity, actualPrice, totalAmount, profit, saleId]
+    );
+
+    await client.query(
+      `INSERT INTO stock_logs
+       (product_id, previous_quantity, new_quantity, change_type)
+       VALUES ($1, $2, $3, 'sale_edited')`,
+      [sale.product_id, Number(product.quantity), newStock]
+    );
+
+    await client.query("COMMIT");
+    res.json(updatedSale.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    res.status(500).json({ error: "Failed to edit sale." });
+  } finally {
+    client.release();
+  }
+});
+
+// Delete a sale and return its quantity to inventory
+app.delete("/api/sales/:id", async (req, res) => {
+  const saleId = Number(req.params.id);
+
+  if (!Number.isInteger(saleId) || saleId <= 0) {
+    return res.status(400).json({ error: "Invalid sale ID." });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const saleResult = await client.query(
+      "SELECT * FROM sales WHERE id = $1 FOR UPDATE",
+      [saleId]
+    );
+
+    if (!saleResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Sale not found." });
+    }
+
+    const sale = saleResult.rows[0];
+
+    const productResult = await client.query(
+      "SELECT * FROM products WHERE id = $1 FOR UPDATE",
+      [sale.product_id]
+    );
+
+    if (!productResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Product not found." });
+    }
+
+    const previousStock = Number(productResult.rows[0].quantity);
+    const newStock = previousStock + Number(sale.quantity);
+
+    await client.query(
+      "UPDATE products SET quantity = $1 WHERE id = $2",
+      [newStock, sale.product_id]
+    );
+
+    await client.query("DELETE FROM sales WHERE id = $1", [saleId]);
+
+    await client.query(
+      `INSERT INTO stock_logs
+       (product_id, previous_quantity, new_quantity, change_type)
+       VALUES ($1, $2, $3, 'sale_deleted')`,
+      [sale.product_id, previousStock, newStock]
+    );
+
+    await client.query("COMMIT");
+    res.json({ message: "Sale deleted and stock restored." });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    res.status(500).json({ error: "Failed to delete sale." });
+  } finally {
+    client.release();
+  }
+});
 
 const PORT = process.env.PORT || 5000;
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });

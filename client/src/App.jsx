@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-const API = import.meta.env.SERVER_API;
+const API = "http://localhost:5000/api"; 
 
 const emptyForm = {
   name: "",
@@ -30,6 +30,56 @@ const emptySaleForm = {
   quantity: "1",
   actual_price: "",
 };
+async function editSale(sale) {
+    const quantityInput = prompt("Updated quantity:", sale.quantity);
+    if (quantityInput === null) return;
+  
+    const priceInput = prompt("Actual price per item (₹):", sale.actual_price);
+    if (priceInput === null) return;
+  
+    const quantity = Number(quantityInput);
+    const actual_price = Number(priceInput);
+  
+    if (!Number.isInteger(quantity) || quantity <= 0 ||
+        !Number.isFinite(actual_price) || actual_price < 0) {
+      alert("Enter a valid quantity and price.");
+      return;
+    }
+  
+    try {
+      const response = await fetch(`${API}/sales/${sale.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ quantity, actual_price }),
+      });
+  
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not edit sale.");
+  
+      await Promise.all([loadSales(), loadProducts()]);
+    } catch (error) {
+      alert(error.message);
+    }
+  }
+  
+  async function deleteSale(sale) {
+    if (!confirm(`Delete this sale of ${sale.quantity} item(s)? The stock will be restored.`)) {
+      return;
+    }
+  
+    try {
+      const response = await fetch(`${API}/sales/${sale.id}`, {
+        method: "DELETE",
+      });
+  
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not delete sale.");
+  
+      await Promise.all([loadSales(), loadProducts()]);
+    } catch (error) {
+      alert(error.message);
+    }
+  }
 
 export default function App() {
     const [theme, setTheme] = useState(
@@ -57,6 +107,74 @@ export default function App() {
 
   const [imagePreview, setImagePreview] = useState("");
   const [photoUploading, setPhotoUploading] = useState(false);
+  const [stockCounts, setStockCounts] = useState({});
+  const [stockModal, setStockModal] = useState(false);
+const [stockMessage, setStockMessage] = useState("");
+const [stockError, setStockError] = useState("");
+const [savingStock, setSavingStock] = useState(false);
+
+function updateStockCount(productId, quantity) {
+  setStockCounts((previous) => ({
+    ...previous,
+    [productId]: quantity,
+  }));
+}
+
+async function saveStockCount() {
+  const counts = Object.entries(stockCounts).map(([product_id, quantity]) => ({
+    product_id: Number(product_id),
+    quantity: Number(quantity),
+  }));
+
+  if (!counts.length) {
+    setStockError("Enter a counted quantity for at least one product.");
+    return;
+  }
+
+  if (counts.some((item) => !Number.isInteger(item.quantity) || item.quantity < 0)) {
+    setStockError("Quantities must be whole numbers, zero or greater.");
+    return;
+  }
+
+  setSavingStock(true);
+  setStockMessage("");
+  setStockError("");
+
+  try {
+    const response = await fetch(`${API}/stock-count`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "selected", counts }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error || "Could not save stock count.");
+    }
+
+    setStockMessage(data.message || "Stock count saved.");
+    setStockCounts({});
+    await loadProducts();
+  } catch (error) {
+    setStockError(error.message);
+  } finally {
+    setSavingStock(false);
+  }
+}
+
+const [stockLogs, setStockLogs] = useState([]);
+
+async function loadStockLogs() {
+  const response = await fetch(`${API}/stock-logs`);
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.error || "Could not load stock logs");
+  }
+
+  setStockLogs(Array.isArray(data) ? data : []);
+}
 
   async function loadProducts() {
     const response = await fetch(`${API}/products`);
@@ -357,7 +475,8 @@ export default function App() {
             ["dashboard", LayoutDashboard, "Dashboard"],
             ["products", Package, "Products"],
             ["sales", ShoppingCart, "Sales"],
-            ["stock", ClipboardList, "Stock count"],
+            ["history", ClipboardList, "History"],
+            ["stock", Package, "Stock"],
           ].map(([id, Icon, label]) => (
             <button
               key={id}
@@ -367,9 +486,8 @@ export default function App() {
                 setPage(id);
                 setMenu(false);
 
-                if (id === "sales") {
-                  openSalesPage();
-                }
+                if (id === "sales") openSalesPage();
+                if (id === "history") Promise.all([loadSales(), loadStockLogs()]).catch((error) => setSaleError(error.message));
               }}
             >
               <Icon size={19} />
@@ -400,7 +518,9 @@ export default function App() {
                 ? "Products"
                 : page === "sales"
                 ? "Sales"
-                : "Stock count"}
+                : page === "history"
+                ? "Sales history"
+                : "Stock"}
             </h1>
             <p>Manage your inventory in one place.</p>
           </div>
@@ -650,68 +770,123 @@ export default function App() {
               </button>
             </form>
 
-            <div className="sales-history">
-              <div className="section-heading">
-                <div>
-                  <h2>Sales history</h2>
-                  <p>{sales.length} recorded sales</p>
-                </div>
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() =>
-                    loadSales().catch((error) => setSaleError(error.message))
-                  }
-                >
-                  Refresh
-                </button>
-              </div>
 
-              {sales.length === 0 ? (
-                <p className="empty-message">No sales recorded yet.</p>
-              ) : (
-                <div className="sales-list">
-                  {sales.map((sale, index) => (
-                    <article
-                      className="sale-row"
-                      key={sale.id ?? `${sale.product_id}-${sale.sold_at}-${index}`}
-                    >
-                      <div>
-                        <strong>{getSaleProductName(sale)}</strong>
-                        <p>
-                          {sale.quantity} × ₹{formatMoney(sale.actual_price)}
-                        </p>
-                        {sale.sold_at && (
-                          <small>
-                            {new Date(sale.sold_at).toLocaleString("en-IN")}
-                          </small>
-                        )}
-                      </div>
-                      <strong>
-                        ₹
-                        {formatMoney(
-                          sale.total_amount ??
-                            Number(sale.quantity) * Number(sale.actual_price)
-                        )}
-                      </strong>
-                    </article>
-                  ))}
-                </div>
-              )}
-            </div>
           </section>
         )}
+
+
+
+{page === "history" && (
+  <section className="content-card">
+    <div className="section-heading">
+      <div>
+        <h2>Sales history</h2>
+        <p>{sales.length} recorded sales</p>
+      </div>
+
+      <button
+        type="button"
+        onClick={() => loadSales().catch((error) => setSaleError(error.message))}
+      >
+        Refresh
+      </button>
+    </div>
+
+    {saleError && <p className="error-message">{saleError}</p>}
+    
+
+    <div className="table-wrapper">
+      <table className="sales-table">
+        <thead>
+          <tr>
+            <th>Product</th>
+            <th>Quantity</th>
+            <th>Price per item</th>
+            <th>Total sale</th>
+            <th>Profit</th>
+            <th>Date</th>
+          <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sales.map((sale) => (
+            <tr key={sale.id}>
+              <td>{getSaleProductName(sale)}</td>
+              <td>{sale.quantity}</td>
+              <td>₹{formatMoney(sale.actual_price)}</td>
+              <td>₹{formatMoney(sale.total_amount)}</td>
+              <td>₹{formatMoney(sale.profit)}</td>
+              <td>
+                {sale.sold_at
+                  ? new Date(sale.sold_at).toLocaleString()
+                  : "—"}
+              </td>
+              <td className="sale-actions">
+  <button
+    type="button"
+    onClick={() => editSale(sale)}
+  >
+    Edit
+  </button>
+
+  <button
+    type="button"
+    className="delete-button"
+    onClick={() => deleteSale(sale)}
+  >
+    Delete
+  </button>
+</td>
+            </tr>
+          ))}
+
+          {sales.length === 0 && (
+            <tr>
+              <td colSpan="6" className="empty-row">
+                No sales recorded yet.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  </section>
+)}
 
         {page === "stock" && (
-          <section className="content-card">
-            <h2>Stock count</h2>
-            <p>
-              The stock-count screen is not connected in this version yet.
-              Use the existing stock-count API until we add its form.
-            </p>
+          <section className="content-card stock-page">
+            <div className="section-heading">
+              <div><h2>Stock</h2><p>Choose a product card to adjust its quantity.</p></div>
+            </div>
+            {stockMessage && <p className="success-message" role="status">{stockMessage}</p>}
+            {stockError && <p className="error-message" role="alert">{stockError}</p>}
+            {products.length === 0 ? <p className="empty-message">No products to manage yet.</p> : (
+              <div className="stock-card-grid">
+                {products.map((product) => (
+                  <button className="stock-product-card" type="button" key={product.id} onClick={() => { setSelectedProduct(product); setStockCounts({ [product.id]: String(product.quantity) }); setStockError(""); setStockMessage(""); setStockModal(true); }}>
+                    <span className="stock-card-name">{product.name}</span>
+                    <strong>{product.quantity} <small>in stock</small></strong>
+                    <span className="stock-card-hint">Click to adjust</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </section>
         )}
+
       </main>
+
+      {stockModal && selectedProduct && (
+        <div className="modal-backdrop" onClick={() => setStockModal(false)}>
+          <form className="modal stock-adjust-modal" onSubmit={(event) => { event.preventDefault(); saveStockCount(); }} onClick={(event) => event.stopPropagation()}>
+            <div className="modal-heading"><h2>Adjust stock</h2><button type="button" onClick={() => setStockModal(false)} aria-label="Close stock editor"><X /></button></div>
+            <p>{selectedProduct.name} · Current stock: {selectedProduct.quantity}</p>
+            <label>New quantity<input type="number" min="0" step="1" required value={stockCounts[selectedProduct.id] ?? ""} onChange={(event) => updateStockCount(selectedProduct.id, event.target.value)} /></label>
+            <small>Reducing stock records the difference as a sale at the current selling price. Increasing stock only adjusts inventory.</small>
+            <button className="primary save-button" type="submit" disabled={savingStock}>{savingStock ? "Saving…" : "Save stock"}</button>
+          </form>
+        </div>
+      )}
 
       {modal && (
         <div className="modal-backdrop" onClick={() => setModal(false)}>
