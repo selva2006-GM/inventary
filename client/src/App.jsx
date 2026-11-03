@@ -15,8 +15,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-const API = import.meta.env.SERVER_API;
-
+const API = `${import.meta.env.VITE_API_URL}/api`;
 const emptyForm = {
   name: "",
   purchase_price: "",
