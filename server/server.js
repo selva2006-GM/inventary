@@ -429,6 +429,29 @@ app.delete("/api/products/:id", async (req, res) => {
   }
 });
 
+// Get stock change history (sales + stock counts + manual adjustments)
+app.get("/api/stock-logs", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        sl.id,
+        sl.product_id,
+        p.name AS product_name,
+        sl.previous_quantity,
+        sl.new_quantity,
+        sl.change_type,
+        sl.created_at
+      FROM stock_logs sl
+      LEFT JOIN products p ON p.id = sl.product_id
+      ORDER BY sl.created_at DESC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Failed to fetch stock logs:", error);
+    res.status(500).json({ error: "Failed to fetch stock logs." });
+  }
+});
 
 
 
