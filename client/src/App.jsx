@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-const API = import.meta.env.SERVER_API; 
+const API = `${import.meta.env.SERVER_API}/api`;
 
 const emptyForm = {
   name: "",
